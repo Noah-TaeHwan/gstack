@@ -613,8 +613,16 @@ interface LockInfo {
   started_at: string;
 }
 
-function acquireLock(): boolean {
-  mkdirSync(GSTACK_HOME, { recursive: true });
+type LockAcquireResult =
+  | { acquired: true }
+  | { acquired: false; reason: "held" | "unavailable" };
+
+function acquireLock(): LockAcquireResult {
+  try {
+    mkdirSync(GSTACK_HOME, { recursive: true });
+  } catch {
+    return { acquired: false, reason: "unavailable" };
+  }
   if (existsSync(LOCK_PATH)) {
     // Check if stale.
     try {
@@ -624,19 +632,25 @@ function acquireLock(): boolean {
         // Stale; take over.
         unlinkSync(LOCK_PATH);
       } else {
-        return false;
+        return { acquired: false, reason: "held" };
       }
     } catch {
-      // Cannot stat; bail conservatively.
-      return false;
+      // Cannot inspect or replace the lock; do not misreport another live run.
+      return { acquired: false, reason: "unavailable" };
     }
   }
   const info: LockInfo = { pid: process.pid, started_at: new Date().toISOString() };
   try {
     writeFileSync(LOCK_PATH, JSON.stringify(info), { encoding: "utf-8", flag: "wx" });
-    return true;
+    return { acquired: true };
   } catch {
-    return false;
+    // A race may have created the lock after existsSync(). Distinguish that
+    // from an unwritable GSTACK_HOME so sandbox/permission failures stay
+    // actionable instead of masquerading as concurrent execution.
+    return {
+      acquired: false,
+      reason: existsSync(LOCK_PATH) ? "held" : "unavailable",
+    };
   }
 }
 
@@ -1481,12 +1495,20 @@ async function main(): Promise<void> {
   const needsLock = args.mode !== "dry-run";
   let haveLock = false;
   if (needsLock) {
-    haveLock = acquireLock();
-    if (!haveLock) {
-      console.error(
-        `[gbrain-sync] another /sync-gbrain is running (lock at ${LOCK_PATH}). ` +
-        `If that process died, the lock auto-clears after 5 min, or remove it manually.`
-      );
+    const lock = acquireLock();
+    haveLock = lock.acquired;
+    if (!lock.acquired) {
+      if (lock.reason === "held") {
+        console.error(
+          `[gbrain-sync] another /sync-gbrain is running (lock at ${LOCK_PATH}). ` +
+          `If that process died, the lock auto-clears after 5 min, or remove it manually.`
+        );
+      } else {
+        console.error(
+          `[gbrain-sync] cannot create or inspect the sync lock at ${LOCK_PATH}. ` +
+          `Verify write access to GSTACK_HOME (${GSTACK_HOME}) and retry.`
+        );
+      }
       process.exit(2);
     }
   }

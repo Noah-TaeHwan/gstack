@@ -267,4 +267,21 @@ describe("gstack-gbrain-sync — split-engine SKIP (plan D12)", () => {
       env.cleanup();
     }
   });
+
+  it("reports an unwritable sync-lock location without claiming another run", () => {
+    const env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: true });
+    try {
+      rmSync(env.gstackHome, { recursive: true, force: true });
+      writeFileSync(env.gstackHome, "not-a-directory");
+
+      const r = runOrchestrator(env, ["--code-only"]);
+      const out = r.stdout + r.stderr;
+      expect(r.exitCode).toBe(2);
+      expect(out).toContain("cannot create or inspect the sync lock");
+      expect(out).toContain("Verify write access to GSTACK_HOME");
+      expect(out).not.toContain("another /sync-gbrain is running");
+    } finally {
+      env.cleanup();
+    }
+  });
 });
