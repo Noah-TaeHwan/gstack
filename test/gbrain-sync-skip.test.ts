@@ -210,14 +210,16 @@ describe("gstack-gbrain-sync — split-engine SKIP (plan D12)", () => {
     }
   });
 
-  it("SKIPs with actionable guidance when PGLite is held by gbrain serve (#2194)", () => {
+  it("SKIPs without telling users to stop a healthy long-lived GBrain service", () => {
     const env = makeEnv({ withGbrain: true, gbrainBehavior: "engine-locked", withConfig: true });
     try {
       const r = runOrchestrator(env, ["--code-only"]);
       const out = r.stdout + r.stderr;
       expect(out).toContain("local engine engine-locked");
-      expect(out).toContain("gbrain serve");
-      expect(out).toContain("outside the live Claude session");
+      expect(out).toContain("long-lived GBrain HTTP service");
+      expect(out).toContain("do not stop a healthy service");
+      expect(out).toContain("separate GBRAIN_HOME");
+      expect(out).not.toContain("outside the live Claude session");
       expect(out).not.toContain("config.json is malformed");
     } finally {
       env.cleanup();

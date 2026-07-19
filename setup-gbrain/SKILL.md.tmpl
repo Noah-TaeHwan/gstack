@@ -155,6 +155,19 @@ For `gbrain_local_status` values of `no-cli` or `missing-config`, do NOT fire
 Step 1.5 — fall through to Step 2 (where `no-cli` triggers Step 3 install and
 `missing-config` triggers Step 4 init).
 
+For **`engine-locked`**, branch on the MCP transport instead of treating the
+lock as a broken engine:
+
+- If `gbrain_mcp_mode == "remote-http"`, a long-running HTTP GBrain service may
+  be the valid PGLite owner. Do not move the config, stop the service, or offer
+  destructive repair. Report: "The HTTP service owns the local PGLite. MCP
+  queries remain available; direct CLI code/memory indexing is unavailable
+  while that service owns the single-process engine." Continue to Step 5a and
+  verify the MCP registration.
+- Otherwise, STOP and report that another local `gbrain serve` process owns
+  PGLite. The user must intentionally stop that owner or choose a separate
+  `GBRAIN_HOME`; never kill it as an automatic setup repair.
+
 ---
 
 ## Step 2: Pick a path (AskUserQuestion)
@@ -183,10 +196,11 @@ Options (present based on detected state):
 - **3 — PGLite local.** Zero accounts, ~30 seconds. Isolated brain on this
   Mac only. Best for try-first.
 - **4 — Remote gbrain MCP.** Someone else (or another machine of yours) is
-  already running `gbrain serve` with HTTP transport. You paste the MCP URL
-  + a bearer token; this skill registers it as your MCP. No local brain DB,
-  no local install needed. Recommended when the brain is shared across
-  machines or run by a teammate.
+  already running `gbrain serve` with HTTP transport. You paste the MCP URL;
+  exact loopback servers use consent-bearing OAuth/DCR, while non-loopback
+  servers use the supplied bearer credential. No local brain DB or install is
+  required on a thin client. Recommended when the brain is shared across
+  machines or managed by a long-running local service.
 - **Switch** (only if Step 1 detected an existing engine): "You already have
   a `<engine>` brain. Migrate it to the other engine?" → runs
   `gbrain migrate --to <other>` wrapped in `timeout 180s` (D9).
@@ -371,7 +385,33 @@ Read with plain `read -r` (no secret hygiene needed — the URL alone isn't
 a credential). Validate it starts with `https://` (require TLS for any
 non-loopback host); refuse `http://` for non-localhost.
 
-**4b. Collect bearer token via the secret-read helper (D10, never argv).**
+**4b. Pick the HTTP auth flow.** Loopback GBrain servers that publish OAuth
+metadata use Claude Code's OAuth/DCR flow. Detect only exact loopback hosts;
+never downgrade a non-loopback endpoint to plain HTTP:
+
+```bash
+case "$MCP_URL" in
+  http://localhost:*|http://127.0.0.1:*|http://\[::1\]:*)
+    GBRAIN_LOOPBACK_OAUTH=1
+    OAUTH_BASE=$(printf '%s' "$MCP_URL" | sed 's#/mcp$##')
+    oauth_meta=$(curl --fail --silent --show-error \
+      "$OAUTH_BASE/.well-known/oauth-authorization-server") || exit $?
+    printf '%s' "$oauth_meta" | jq -e \
+      '.authorization_endpoint and .token_endpoint and .registration_endpoint' \
+      >/dev/null || { echo "Loopback GBrain does not publish complete OAuth metadata." >&2; exit 1; }
+    ;;
+  *)
+    GBRAIN_LOOPBACK_OAUTH=0
+    ;;
+esac
+```
+
+When `GBRAIN_LOOPBACK_OAUTH=1`, do **not** ask for a bearer token and do not
+put an `Authorization` header in `~/.claude.json`; Step 5a performs
+`claude mcp login gbrain`.
+
+For non-loopback Path 4 endpoints, collect the bearer token via the
+secret-read helper (D10, never argv):
 
 ```bash
 . ~/.claude/skills/gstack/bin/gstack-gbrain-lib.sh
@@ -379,8 +419,8 @@ read_secret_to_env GBRAIN_MCP_TOKEN "Paste bearer token: " \
   --echo-redacted 's/.\{6\}$/***REDACTED***/'
 ```
 
-**4c. Verify via gstack-gbrain-mcp-verify.** Run the helper; capture the
-classified JSON output:
+**4c. Verify the selected auth flow.** For non-loopback bearer auth, run the
+helper and capture the classified JSON output:
 
 ```bash
 verify_json=$(GBRAIN_MCP_TOKEN="$GBRAIN_MCP_TOKEN" \
@@ -395,7 +435,10 @@ a clear "fix and re-run /setup-gbrain" message. Do NOT continue to Step 5a
 on a failed verify — partial registration would leave the user with a
 half-broken state.
 
-Capture two values from the verify output for downstream steps:
+For loopback OAuth, defer the authenticated tool round-trip to Step 5a; the
+metadata probe above proves discovery only, not authorization.
+
+Capture two values from the non-loopback verify output for downstream steps:
 - `SERVER_VERSION` (e.g., `0.27.1`) — written to the CLAUDE.md block in Step 8.
 - `URL_FORM_SUPPORTED` (`true|false`) — passed to `gstack-artifacts-init` in
   Step 7 to control which form of the brain-admin hookup command is printed.
@@ -463,11 +506,9 @@ was picked, Steps 3/4/5 are no-ops; also skip Step 7.5 (transcript ingest)
 since memory-stage routes through the artifacts pipeline in remote-http mode
 per plan D11.
 
-The bearer token (`GBRAIN_MCP_TOKEN`) stays in process env until Step 5a's
-`claude mcp add --header` consumes it; then `unset GBRAIN_MCP_TOKEN`
-immediately. Token security trade-off documented in
-`setup-gbrain/memory.md`: brief argv exposure during `claude mcp add`,
-resting state in `~/.claude.json` mode 0600.
+For non-loopback bearer auth, `GBRAIN_MCP_TOKEN` stays in process env until
+Step 5a's `claude mcp add --header` consumes it; then unset it immediately.
+For loopback OAuth, no bearer is collected or written to `~/.claude.json`.
 
 ### Switch (from detect's existing-engine state)
 
@@ -513,9 +554,26 @@ The registration form depends on the path picked in Step 2:
 
 ### Path 4 (Remote MCP — HTTP transport with bearer)
 
-Tear down any prior registration (could be local-stdio from an old setup,
-or stale remote-http with a rotated token), then register with HTTP +
-bearer at user scope:
+For `GBRAIN_LOOPBACK_OAUTH=1`, tear down any prior static-header registration,
+register the URL without headers, and use Claude Code's OAuth login:
+
+```bash
+claude mcp logout gbrain 2>/dev/null || true
+claude mcp remove gbrain -s user 2>/dev/null || true
+claude mcp remove gbrain 2>/dev/null || true
+claude mcp add --scope user --transport http gbrain "$MCP_URL"
+claude mcp login gbrain
+claude mcp list | grep gbrain  # verify: should show "Connected"
+```
+
+The login must complete in an interactive terminal because authorization is
+consent-bearing. Verify afterward that the gbrain entry has no static
+`Authorization` header, then make one real `whoami` or `get_stats` MCP call in
+a fresh Claude Code session. A metadata response or "Authenticated" message
+alone is not end-to-end proof.
+
+For non-loopback Path 4, tear down any prior registration and register with
+HTTP + bearer at user scope:
 
 ```bash
 claude mcp remove gbrain -s user 2>/dev/null || true
@@ -526,7 +584,7 @@ unset GBRAIN_MCP_TOKEN  # zero from process env after registration
 claude mcp list | grep gbrain  # verify: should show "✓ Connected"
 ```
 
-**Token-storage note:** `claude mcp add --header "Authorization: Bearer ..."`
+**Non-loopback token-storage note:** `claude mcp add --header "Authorization: Bearer ..."`
 puts the bearer on argv during process startup, briefly visible to `ps` for
 ~10ms. The token's resting state is `~/.claude.json` (mode 0600 — Claude
 Code's own credential surface for every MCP server). This trade-off is
@@ -760,15 +818,18 @@ Find-and-replace (or append) the section. Block format depends on mode:
 - Server version: gbrain v{SERVER_VERSION}  (from Step 4c verify)
 - Setup date: {today}
 - MCP registered: yes (user scope)
-- Token: stored in ~/.claude.json (do not commit; never written to CLAUDE.md)
+- Auth: {Claude OAuth/DCR for loopback | static bearer for non-loopback}
 - Artifacts repo: {gstack_artifacts_remote URL or "none"}
 - Artifacts sync: {off|artifacts-only|full}
 - Current repo policy: {read-write|read-only|deny|unset}
 ```
 
-The bearer token is **never** written to CLAUDE.md (CLAUDE.md is checked
-in to git in many projects). It lives only in `~/.claude.json` where
-`claude mcp add` placed it.
+The bearer token is **never** written to CLAUDE.md, and neither are OAuth
+credentials (CLAUDE.md is checked into git in many projects). Loopback OAuth
+registrations must have no static
+`Authorization` header in `~/.claude.json`; Claude Code stores and refreshes
+the OAuth credential in its own credential store. For non-loopback bearer
+mode, the bearer lives only in Claude Code's MCP config.
 
 ### Paths 1, 2a, 2b, 3 (Local stdio)
 
@@ -833,20 +894,23 @@ the round-trip works.
 
 ### Path 4 (Remote MCP)
 
-The `mcp__gbrain__*` tools aren't visible mid-session — they're loaded at
-Claude Code session start. So the live smoke test in this same skill run is
-informational: print the curl-equivalent the user can run after restarting
-Claude Code. The verify round-trip in Step 4c already proved the server is
-reachable + authed + on a compatible MCP version, so we don't re-test that.
+The `mcp__gbrain__*` tools aren't added to an already-open Claude Code
+session. After registration, launch a fresh Claude Code process and require
+one real `whoami` or `get_stats` MCP call. Do not use shell/file fallback and
+do not call the setup complete from metadata or login output alone.
+
+For loopback OAuth, the fresh-process call is the required end-to-end smoke;
+there is intentionally no copy-paste bearer command. For non-loopback bearer
+mode, Step 4c's helper is the transport/auth smoke, and the fresh-process call
+proves Claude Code actually loaded the tool surface.
 
 Print to stdout:
 
 ```
-After restarting Claude Code, the `mcp__gbrain__*` tools become callable.
-Smoke test: ask the agent to run `mcp__gbrain__search` with any query
-("test page" works). You should see a JSON list of pages.
+After restarting Claude Code, run `mcp__gbrain__whoami`, then
+`mcp__gbrain__search` with a non-sensitive query. Both calls must succeed.
 
-To verify from the shell right now (without waiting for restart):
+For non-loopback bearer mode only, this redacted diagnostic is also available:
   curl -s -X POST -H 'Content-Type: application/json' \
        -H 'Accept: application/json, text/event-stream' \
        -H 'Authorization: Bearer <YOUR_TOKEN>' \
@@ -854,8 +918,8 @@ To verify from the shell right now (without waiting for restart):
        <YOUR_MCP_URL>
 ```
 
-Do NOT print the actual token in the curl command — leave the placeholder
-`<YOUR_TOKEN>` so the snippet is safe to copy into chat / share.
+Do NOT print the actual token in the curl command. In loopback OAuth mode,
+omit this curl snippet entirely because Claude Code owns the OAuth lifecycle.
 
 ### Paths 1, 2a, 2b, 3 (Local stdio)
 
@@ -961,7 +1025,7 @@ template. Each row is `[OK]/[FIX]/[WARN]/[ERR]`.
 gbrain status: GREEN  (mode: remote-http)
 
   MCP ............. OK   {SERVER_NAME} v{SERVER_VERSION} at {MCP_URL}
-  Auth ............ OK   bearer accepted (verified via /tools/list)
+  Auth ............ OK   {OAuth/DCR consent + fresh MCP call | bearer accepted}
   Engine .......... N/A  remote mode
   Doctor .......... N/A  remote mode (brain admin runs `gbrain doctor`)
   Repo policy ..... OK   {read-write|read-only|deny}
@@ -970,10 +1034,11 @@ gbrain status: GREEN  (mode: remote-http)
   Transcripts ..... OK   route to artifacts repo → remote brain (plan D11)
   Code search ..... {OK local-pglite (~/.gbrain/pglite) | N/A declined at Step 4d}
   CLAUDE.md ....... OK
-  Smoke test ...... INFO printed for post-restart manual verification
+  Smoke test ...... OK   fresh Claude process called whoami/get_stats via MCP
 
 Restart Claude Code to pick up the `mcp__gbrain__*` tools.
-Re-run `/setup-gbrain` any time the bearer rotates or the URL moves.
+Re-run `/setup-gbrain` when OAuth login expires, a non-loopback bearer rotates,
+or the URL moves.
 ```
 
 The **Code search** row reflects the choice at Step 4d:
