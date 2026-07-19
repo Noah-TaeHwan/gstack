@@ -219,6 +219,7 @@ describe("gstack-gbrain-sync — split-engine SKIP (plan D12)", () => {
       expect(out).toContain("long-lived GBrain HTTP service");
       expect(out).toContain("do not stop a healthy service");
       expect(out).toContain("separate GBRAIN_HOME");
+      expect(out).toContain("0 ok, 0 error, 1 skipped");
       expect(out).not.toContain("outside the live Claude session");
       expect(out).not.toContain("config.json is malformed");
     } finally {

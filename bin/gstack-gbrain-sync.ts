@@ -1569,9 +1569,10 @@ async function main(): Promise<void> {
     const allStages = dreamStage ? [...stages, dreamStage] : stages;
     console.log(`\ngstack-gbrain-sync (${args.mode}):`);
     for (const s of allStages) console.log(formatStage(s));
-    const okCount = allStages.filter((s) => s.ok).length;
+    const okCount = allStages.filter((s) => s.ran && s.ok).length;
     const errCount = allStages.filter((s) => !s.ok && s.ran).length;
-    console.log(`\n  ${okCount} ok, ${errCount} error, ${allStages.length - okCount - errCount} skipped`);
+    const skippedCount = allStages.filter((s) => !s.ran).length;
+    console.log(`\n  ${okCount} ok, ${errCount} error, ${skippedCount} skipped`);
   }
 
   process.exit(exitCode);
